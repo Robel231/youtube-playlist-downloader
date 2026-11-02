@@ -8,10 +8,17 @@ themselves in `~/Videos/<playlist name>/` instead.
 Built on `yt-dlp`, `ffmpeg` and PySide6, all of which come from Fedora's
 repositories:
 
+![The window downloading a playlist](docs/screenshot.png)
+
 ```sh
 sudo dnf install yt-dlp ffmpeg python3-pyside6 wl-clipboard
+git clone https://github.com/Robel231/youtube-playlist-downloader.git
+cd youtube-playlist-downloader
 ./install.sh          # launcher entry + `playlist-dl` command
 ```
+
+It's written for Fedora KDE on Wayland, but runs anywhere those four packages
+do; without `wl-paste` it reads the clipboard through Qt instead.
 
 ## Using it
 
@@ -78,3 +85,7 @@ uploads usually come as AV1, which current Fedora plays fine.
 - If YouTube changes something and downloads start failing, updating yt-dlp
   usually fixes it: `sudo dnf upgrade yt-dlp`.
 - Tests: `python3 -m pytest tests`
+
+## License
+
+MIT, see [LICENSE](LICENSE).
