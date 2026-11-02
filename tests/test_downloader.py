@@ -112,3 +112,29 @@ def test_summary_describe():
 def test_cli_rejects_non_youtube_link(capsys):
     assert dl.main(['https://example.com', '--dir', os.devnull]) == 2
     assert 'No YouTube link' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('max_height, sort', [(None, 'res'), (720, 'res:720')])
+def test_build_argv_video_is_accepted_by_yt_dlp(tmp_path, max_height, sort):
+    argv = dl.build_argv(tmp_path, True, None, mode=dl.VIDEO, max_height=max_height)
+    opts = dl.ydl_options(argv)
+    keys = [pp['key'] for pp in opts['postprocessors']]
+    assert opts['format_sort'] == [sort, 'ext:mp4:m4a']
+    assert opts['merge_output_format'] == 'mp4'
+    assert opts['download_archive'] == str(tmp_path / '.archive-video.txt')
+    assert 'FFmpegExtractAudio' not in keys
+    assert {'MetadataParser', 'FFmpegMetadata', 'EmbedThumbnail'} <= set(keys)
+    assert 'embedthumbnail+ffmpeg_o' not in opts.get('postprocessor_args', {})
+
+
+def test_archives_are_kept_per_mode(tmp_path):
+    (tmp_path / '.archive.txt').write_text('youtube abc\n', encoding='utf-8')
+    (tmp_path / '.archive-video.txt').write_text('youtube xyz\n', encoding='utf-8')
+    assert dl.archived_ids(tmp_path, dl.AUDIO) == {'abc'}
+    assert dl.archived_ids(tmp_path, dl.VIDEO) == {'xyz'}
+
+
+def test_cli_rejects_unknown_resolution(capsys):
+    with pytest.raises(SystemExit):
+        dl.main(['https://youtu.be/abc', '--video', '--res', '999'])
+    assert 'invalid choice' in capsys.readouterr().err

@@ -1,5 +1,6 @@
 #!/usr/bin/python3
-"""Playlist Audio Downloader: copy a YouTube link, get MP3s in ~/Music.
+"""Playlist Audio Downloader: copy a YouTube link, get MP3s in ~/Music
+(or MP4 videos in ~/Videos).
 
 The window watches the clipboard and puts each YouTube link you copy in the
 link box. Nothing downloads until you press Download; links added while a
@@ -20,7 +21,7 @@ from PySide6.QtCore import QProcess, QSettings, Qt, QThread, QTimer, QUrl, Signa
 from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QIcon, QPalette
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QApplication, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMessageBox, QProgressBar, QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -30,6 +31,7 @@ APP_ID = 'playlist-audio-downloader'
 APP_NAME = 'Playlist Audio Downloader'
 SERVER_NAME = f'{APP_ID}-{os.getuid()}'
 CLIPBOARD_POLL_MS = 1000
+ROOT_KEYS = {dl.AUDIO: 'root', dl.VIDEO: 'video_root'}  # each format keeps its own folder
 
 STATUS_TEXT = {
     dl.PENDING: '',
@@ -45,9 +47,10 @@ class Worker(QThread):
     event = Signal(str, object)
     job_done = Signal(object, str)  # Summary (or None), error text
 
-    def __init__(self, url, root, parent):
+    def __init__(self, job, root, parent):
         super().__init__(parent)  # owned by the window, so Python can't free it mid-run
-        self.url, self.root = url, root
+        self.url, self.mode, self.max_height = job
+        self.root = root
         self.cancel = threading.Event()
 
     def _emit(self, kind, data):
@@ -60,7 +63,9 @@ class Worker(QThread):
 
     def run(self):
         try:
-            self.job_done.emit(dl.download(self.url, self.root, self._emit, self.cancel), '')
+            summary = dl.download(self.url, self.root, self._emit, self.cancel,
+                                  self.mode, self.max_height)
+            self.job_done.emit(summary, '')
         except Exception as e:  # yt-dlp errors, bad folders: shown in the status line
             self.job_done.emit(None, str(e).removeprefix('ERROR: '))
 
@@ -69,10 +74,10 @@ class Window(QWidget):
     def __init__(self):
         super().__init__()
         self.settings = QSettings(APP_ID, APP_ID)
-        self.queue = deque()
+        self.queue = deque()       # (url, mode, max_height) jobs
         self.last_clip = None
         self.worker = None
-        self.current_url = None
+        self.current = None        # the job the worker is running
         self.dest = None
         self.items = {}            # track index -> QTreeWidgetItem
         self.progress = {}         # track index -> percent of that track finished
@@ -103,9 +108,28 @@ class Window(QWidget):
         self.stop_btn.setToolTip('Stop the current download and clear the queue')
         self.stop_btn.clicked.connect(self.stop_clicked)
 
-        self.dir_edit = QLineEdit(self.settings.value('root', str(dl.default_music_dir())))
+        self.mode_box = QComboBox()
+        self.mode_box.addItem(QIcon.fromTheme('audio-x-generic'), 'Audio (MP3)', dl.AUDIO)
+        self.mode_box.addItem(QIcon.fromTheme('video-x-generic'), 'Video (MP4)', dl.VIDEO)
+        self.mode_box.setToolTip('What to save. Applies to the next link you download.')
+        self.res_box = QComboBox()
+        self.res_box.addItem('Best', 0)
+        for height in dl.VIDEO_HEIGHTS:
+            self.res_box.addItem(f'{height}p', height)
+        self.res_box.setToolTip('Highest video resolution. A video that is never that small\n'
+                                'is saved at the next size up.')
+        self.res_box.setCurrentIndex(max(0, self.res_box.findData(
+            int(self.settings.value('max_height', dl.DEFAULT_HEIGHT)))))
+        self.res_box.currentIndexChanged.connect(
+            lambda: self.settings.setValue('max_height', self.res_box.currentData()))
+        self.mode_box.setCurrentIndex(max(0, self.mode_box.findData(
+            self.settings.value('mode', dl.AUDIO))))
+        self.mode_box.currentIndexChanged.connect(self.mode_changed)
+
+        self.dir_edit = QLineEdit(self.saved_root(self.mode()))
         self.dir_edit.editingFinished.connect(
-            lambda: self.settings.setValue('root', self.dir_edit.text()))
+            lambda: self.settings.setValue(ROOT_KEYS[self.mode()], self.dir_edit.text()))
+        self.res_box.setEnabled(self.mode() == dl.VIDEO)
         browse = QPushButton(QIcon.fromTheme('document-open-folder'), 'Browse…')
         browse.clicked.connect(self.browse_clicked)
 
@@ -141,6 +165,9 @@ class Window(QWidget):
         row.addWidget(self.download_btn)
         row.addWidget(self.stop_btn)
         dir_row = QHBoxLayout()
+        dir_row.addWidget(self.mode_box)
+        dir_row.addWidget(self.res_box)
+        dir_row.addSpacing(8)
         dir_row.addWidget(QLabel('Save to:'))
         dir_row.addWidget(self.dir_edit, 1)
         dir_row.addWidget(browse)
@@ -198,20 +225,27 @@ class Window(QWidget):
         self.enqueue(url)
 
     def enqueue(self, url):
-        if url == self.current_url or url in self.queue:
+        mode = self.mode()
+        job = (url, mode, (self.res_box.currentData() or None) if mode == dl.VIDEO else None)
+        if job == self.current or job in self.queue:
             self.status.setText('That link is already downloading or queued.')
             return
         self.link.setText(url)
-        self.queue.append(url)
+        self.queue.append(job)
         self.start_next()
 
     def start_next(self):
         if self.worker is not None or not self.queue:
             self.update_status()
             return
-        root = Path(os.path.expanduser(self.dir_edit.text().strip() or str(dl.default_music_dir())))
-        self.settings.setValue('root', str(root))
-        self.current_url = self.queue.popleft()
+        self.current = self.queue.popleft()
+        mode = self.current[1]
+        if mode == self.mode():
+            root = self.dir_edit.text().strip() or str(dl.default_dir(mode))
+            self.settings.setValue(ROOT_KEYS[mode], root)
+        else:  # queued before the format was switched: use that format's folder
+            root = self.saved_root(mode)
+        root = Path(os.path.expanduser(root))
         self.tree.clear()
         self.items.clear()
         self.progress.clear()
@@ -220,7 +254,7 @@ class Window(QWidget):
         self.bar.setRange(0, 0)  # busy until the track count is known
         self.stop_btn.setEnabled(True)
 
-        self.worker = Worker(self.current_url, root, self)
+        self.worker = Worker(self.current, root, self)
         self.worker.event.connect(self.on_event)
         self.worker.job_done.connect(self.on_job_done)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -240,7 +274,8 @@ class Window(QWidget):
         if kind == 'probed':
             self.dest = data['dest']
             n = len(data['tracks'])
-            self.title.setText(f"{data['title']}  ·  {n} track{'s' * (n != 1)}")
+            noun = 'video' if self.current[1] == dl.VIDEO else 'track'
+            self.title.setText(f"{data['title']}  ·  {n} {noun}{'s' * (n != 1)}")
             self.title.setToolTip(str(self.dest))
             self.open_btn.setEnabled(True)
             self.bar.setRange(0, max(n, 1) * 100)
@@ -303,7 +338,7 @@ class Window(QWidget):
 
     def on_job_done(self, summary, error):
         self.worker = None
-        url, self.current_url = self.current_url, None
+        (url, mode, _), self.current = self.current, None
         self.stop_btn.setEnabled(False)
         if self.bar.maximum() == 0:
             self.bar.setRange(0, 1)
@@ -315,7 +350,8 @@ class Window(QWidget):
         else:
             text = summary.describe()
             self.status.setText(f'{summary.title}: {text}. Saved in {summary.dest_dir}')
-            self.notify(summary.title, f'{text}\n{summary.dest_dir}')
+            icon = 'folder-videos' if mode == dl.VIDEO else 'folder-music'
+            self.notify(summary.title, f'{text}\n{summary.dest_dir}', icon)
         if self.quit_when_idle:
             QApplication.quit()
             return
@@ -342,12 +378,24 @@ class Window(QWidget):
 
     # ----- other UI -----------------------------------------------------
 
+    def mode(self):
+        return self.mode_box.currentData()
+
+    def saved_root(self, mode):
+        return self.settings.value(ROOT_KEYS[mode], str(dl.default_dir(mode)))
+
+    def mode_changed(self):
+        mode = self.mode()
+        self.settings.setValue('mode', mode)
+        self.res_box.setEnabled(mode == dl.VIDEO)
+        self.dir_edit.setText(self.saved_root(mode))
+
     def browse_clicked(self):
-        start = os.path.expanduser(self.dir_edit.text()) or str(dl.default_music_dir())
+        start = os.path.expanduser(self.dir_edit.text()) or str(dl.default_dir(self.mode()))
         folder = QFileDialog.getExistingDirectory(self, 'Save playlists in', start)
         if folder:
             self.dir_edit.setText(folder)
-            self.settings.setValue('root', folder)
+            self.settings.setValue(ROOT_KEYS[self.mode()], folder)
 
     def bring_to_front(self, url='', token=''):
         if url and (url := dl.normalize_url(url)):

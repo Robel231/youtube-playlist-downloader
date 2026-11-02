@@ -1,11 +1,12 @@
 #!/usr/bin/python3
-"""Download a YouTube playlist (or single video) as tagged MP3 files.
+"""Download a YouTube playlist (or single video) as tagged MP3 or MP4 files.
 
 Core logic shared by the command line (this file) and the window (app.py).
 Nothing in here imports Qt.
 
     playlist-dl                      # use the link on the clipboard
     playlist-dl URL [--dir ~/Music]
+    playlist-dl URL --video          # MP4 video into ~/Videos
 """
 
 import argparse
@@ -28,7 +29,11 @@ YOUTUBE_HOSTS = {
     'youtu.be', 'www.youtu.be',
 }
 SINGLES_DIR = 'Singles'
-ARCHIVE_NAME = '.archive.txt'
+AUDIO, VIDEO = 'audio', 'video'
+# Separate archives, so a folder holding both MP3s and MP4s tracks each on its own.
+ARCHIVE_NAMES = {AUDIO: '.archive.txt', VIDEO: '.archive-video.txt'}
+VIDEO_HEIGHTS = (2160, 1440, 1080, 720, 480, 360)
+DEFAULT_HEIGHT = 1080
 FNM_NODE = Path('~/.local/share/fnm/aliases/default/bin/node')
 
 # Square-crop the 16:9 thumbnail so it looks right as album art.
@@ -46,14 +51,26 @@ PENDING, DOWNLOADING, CONVERTING, DONE, SKIPPED, FAILED = (
     'pending', 'downloading', 'converting', 'done', 'skipped', 'failed')
 
 
-def default_music_dir():
+def _xdg_user_dir(name, fallback):
     try:
-        out = subprocess.run(['xdg-user-dir', 'MUSIC'], capture_output=True, text=True, timeout=5)
+        out = subprocess.run(['xdg-user-dir', name], capture_output=True, text=True, timeout=5)
         if out.returncode == 0 and out.stdout.strip() and out.stdout.strip() != str(Path.home()):
             return Path(out.stdout.strip())
     except (OSError, subprocess.TimeoutExpired):
         pass
-    return Path.home() / 'Music'
+    return Path.home() / fallback
+
+
+def default_music_dir():
+    return _xdg_user_dir('MUSIC', 'Music')
+
+
+def default_video_dir():
+    return _xdg_user_dir('VIDEOS', 'Videos')
+
+
+def default_dir(mode=AUDIO):
+    return default_video_dir() if mode == VIDEO else default_music_dir()
 
 
 def normalize_url(text):
@@ -140,14 +157,19 @@ def js_runtime_args(runtime):
     return ['--js-runtimes', f'{name}:{exe}', '--remote-components', 'ejs:github']
 
 
-def build_argv(dest_dir, is_playlist, runtime, track_count=1):
+def build_argv(dest_dir, is_playlist, runtime, track_count=1, mode=AUDIO, max_height=None):
     digits = max(2, len(str(track_count)))
-    argv = [
-        '-f', 'bestaudio/best',
-        '-x', '--audio-format', 'mp3', '--audio-quality', '192K',
+    if mode == VIDEO:
+        # Best video up to max_height (or the next size up if none is that small)
+        # plus best audio, preferring streams that fit in MP4.
+        res = f'res:{max_height}' if max_height else 'res'
+        argv = ['-S', f'{res},ext:mp4:m4a', '--merge-output-format', 'mp4']
+    else:
+        argv = ['-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', '192K',
+                '--ppa', SQUARE_COVER]
+    argv += [
         '--embed-metadata', '--embed-thumbnail', '--convert-thumbnails', 'jpg',
-        '--ppa', SQUARE_COVER,
-        '--download-archive', str(Path(dest_dir) / ARCHIVE_NAME),
+        '--download-archive', str(Path(dest_dir) / ARCHIVE_NAMES[mode]),
         '--no-overwrites', '--no-mtime', '--color', 'no_color',
         '-P', str(dest_dir),
         '-o', f'%(playlist_index&{{:0{digits}d}} - |)s%(title)s.%(ext)s',
@@ -257,16 +279,19 @@ def target_dir(root, probed):
     return Path(root) / name
 
 
-def archived_ids(dest_dir):
+def archived_ids(dest_dir, mode=AUDIO):
     try:
-        lines = (Path(dest_dir) / ARCHIVE_NAME).read_text(encoding='utf-8').splitlines()
+        lines = (Path(dest_dir) / ARCHIVE_NAMES[mode]).read_text(encoding='utf-8').splitlines()
     except OSError:
         return set()
     return {parts[1] for parts in (line.split() for line in lines) if len(parts) >= 2}
 
 
-def download(url, root, on_event=lambda kind, data: None, cancel=None):
-    """Download `url` as MP3s under `root`. Blocks until finished.
+def download(url, root, on_event=lambda kind, data: None, cancel=None, mode=AUDIO,
+             max_height=None):
+    """Download `url` as MP3s (or MP4s, with mode=VIDEO) under `root`. Blocks until finished.
+
+    max_height caps the video resolution; None means the best available.
 
     on_event(kind, data) is called from this thread with:
       'probed'  {'title', 'dest', 'is_playlist', 'tracks': [Track, ...]}
@@ -323,7 +348,7 @@ def download(url, root, on_event=lambda kind, data: None, cancel=None):
     for t in probed.tracks:
         by_id.setdefault(t.id, t)
 
-    already = archived_ids(dest)
+    already = archived_ids(dest, mode)
     for t in probed.tracks:
         if t.id in already:
             t.status = SKIPPED
@@ -340,6 +365,11 @@ def download(url, root, on_event=lambda kind, data: None, cancel=None):
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate')
             pct = int(d.get('downloaded_bytes', 0) * 100 / total) if total else None
+            if mode == VIDEO and pct is not None:
+                # Video and audio arrive as two files, video first; keep the
+                # percentage rising across both instead of restarting at 0.
+                audio_only = info.get('vcodec') == 'none'
+                pct = 90 + pct // 10 if audio_only else pct * 9 // 10
             if last_percent.get(vid) != pct:
                 last_percent[vid] = pct
                 mark(vid, DOWNLOADING, percent=pct, info=info)
@@ -347,10 +377,11 @@ def download(url, root, on_event=lambda kind, data: None, cancel=None):
     def on_postprocess(d):
         if cancel.is_set():
             raise DownloadCancelled('Stopped by user')
-        if d['status'] == 'started' and d.get('postprocessor') == 'ExtractAudio':
+        if d['status'] == 'started' and d.get('postprocessor') in ('ExtractAudio', 'Merger'):
             mark((d.get('info_dict') or {}).get('id'), CONVERTING, info=d.get('info_dict'))
 
-    opts = ydl_options(build_argv(dest, probed.is_playlist, runtime, len(probed.tracks)))
+    opts = ydl_options(build_argv(dest, probed.is_playlist, runtime, len(probed.tracks), mode,
+                                  max_height))
     opts.update(logger=logger, progress_hooks=[on_progress], postprocessor_hooks=[on_postprocess])
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -378,12 +409,19 @@ def download(url, root, on_event=lambda kind, data: None, cancel=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='playlist-dl',
-        description='Download a YouTube playlist or video as MP3 files. '
+        description='Download a YouTube playlist or video as MP3 (or MP4) files. '
                     'With no URL, the link on the clipboard is used.')
     parser.add_argument('url', nargs='?', help='playlist or video link (default: clipboard)')
-    parser.add_argument('--dir', type=Path, default=default_music_dir(),
-                        help='folder to save into (default: %(default)s)')
+    parser.add_argument('--video', action='store_true',
+                        help='save MP4 video instead of MP3 audio')
+    parser.add_argument('--res', default=str(DEFAULT_HEIGHT),
+                        choices=['best', *map(str, VIDEO_HEIGHTS)],
+                        help='highest video resolution with --video (default: %(default)s)')
+    parser.add_argument('--dir', type=Path,
+                        help=f'folder to save into (default: {default_music_dir()}, '
+                             f'or {default_video_dir()} with --video)')
     args = parser.parse_args(argv)
+    mode = VIDEO if args.video else AUDIO
 
     source = args.url if args.url is not None else read_clipboard()
     url = normalize_url(source)
@@ -419,7 +457,8 @@ def main(argv=None):
             print(('\r\x1b[K' if tty else '') + data['text'], file=sys.stderr, flush=True)
 
     try:
-        summary = download(url, args.dir, on_event)
+        summary = download(url, args.dir or default_dir(mode), on_event, mode=mode,
+                           max_height=None if args.res == 'best' else int(args.res))
     except KeyboardInterrupt:
         print('\nStopped.', file=sys.stderr)
         return 130

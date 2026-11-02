@@ -26,12 +26,12 @@ cat > "$desktop" <<EOF
 Type=Application
 Name=Playlist Audio Downloader
 GenericName=YouTube Audio Downloader
-Comment=Copy a YouTube playlist link and save it as MP3 files
+Comment=Copy a YouTube playlist link and save it as MP3 or MP4 files
 Exec=/usr/bin/python3 "$here/app.py" %u
 Icon=folder-music
 Terminal=false
-Categories=AudioVideo;Audio;
-Keywords=youtube;playlist;mp3;music;download;
+Categories=AudioVideo;Audio;Video;
+Keywords=youtube;playlist;mp3;mp4;music;video;download;
 StartupNotify=true
 SingleMainWindow=true
 EOF
